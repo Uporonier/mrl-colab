@@ -1,5 +1,3 @@
-# ✅ MRL-style embedding fusion training for LLaMA-1B and LLaMA-3B
-
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -9,26 +7,23 @@ from tqdm import tqdm
 import os
 import torch.nn.functional as F
 
-
 # 配置
-model_A_path = '/data/zhaoxinpeng-slurm/workspace/EmbeddingMerage/EmbeddingMerage/models/llama-1b'
-model_B_path = '/data/zhaoxinpeng-slurm/workspace/EmbeddingMerage/EmbeddingMerage/models/llama-3b'
+model_A_path = '/content/mrl-colab/models/llama-1b'
+model_B_path = '/content/mrl-colab/models/llama-3b'
 max_length = 512
 batch_size = 4
-device_ids = [1, 3]
 save_dir = "./checkpoints_mrl"
 os.makedirs(save_dir, exist_ok=True)
 
-# 设备设置
-device_2 = f'cuda:{device_ids[0]}'
-device_3 = f'cuda:{device_ids[1]}'
+# 设备设置 (Only using GPU 0)
+device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
 # 加载模型
 print("Loading models...")
 tokenizer = AutoTokenizer.from_pretrained(model_B_path)
 tokenizer.pad_token = tokenizer.eos_token
-model_A = AutoModelForCausalLM.from_pretrained(model_A_path, torch_dtype=torch.float16).to(device_2)
-model_B = AutoModelForCausalLM.from_pretrained(model_B_path, torch_dtype=torch.float16).to(device_3)
+model_A = AutoModelForCausalLM.from_pretrained(model_A_path, torch_dtype=torch.float16).to(device)
+model_B = AutoModelForCausalLM.from_pretrained(model_B_path, torch_dtype=torch.float16).to(device)
 for p in model_A.parameters(): p.requires_grad = False
 for p in model_B.parameters(): p.requires_grad = False
 vocab_size = model_A.lm_head.out_features
@@ -61,8 +56,7 @@ class MRLProjector(nn.Module):
             logits_all[dim] = logits
         return logits_all
 
-projector = MRLProjector(nested_dims=nested_dims).to(device_2)
-projector = nn.DataParallel(projector, device_ids=device_ids)
+projector = MRLProjector(nested_dims=nested_dims).to(device)
 
 optimizer = torch.optim.AdamW(projector.parameters(), lr=5e-6, weight_decay=0.01)
 scaler = torch.cuda.amp.GradScaler()
@@ -85,13 +79,13 @@ for epoch in range(50):
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}")
     for batch in progress_bar:
         try:
-            input_ids = batch["input_ids"].to(device_2)
-            attention_mask = batch["attention_mask"].to(device_2)
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
             labels = input_ids.detach().clone()
 
             with torch.no_grad():
                 emb_A = model_A.model.embed_tokens(input_ids)  # [bsz, seq, 2048]
-                emb_B = model_B.model.embed_tokens(input_ids.to(device_3)).to(device_2)  # [bsz, seq, 3072]
+                emb_B = model_B.model.embed_tokens(input_ids)  # [bsz, seq, 3072]
 
             with torch.cuda.amp.autocast():
                 z_cat = torch.cat([emb_A, emb_B], dim=-1)  # [bsz, seq, 5120]
@@ -117,4 +111,4 @@ for epoch in range(50):
             continue
 
     if epoch % 5 == 0:
-        torch.save(projector.module.state_dict(), os.path.join(save_dir, f"mrl_projector_epoch{epoch}.pt"))
+        torch.save(projector.state_dict(), os.path.join(save_dir, f"mrl_projector_epoch{epoch}.pt"))
